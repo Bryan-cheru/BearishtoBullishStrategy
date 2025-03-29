@@ -1,0 +1,2232 @@
+using System;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.Cbi;
+using System.Collections.Generic;
+using System.Linq;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.NinjaScript.Indicators;
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class B2BEnhanced : Strategy
+    {
+        #region Variables
+
+        // Version tracking
+        private const string STRATEGY_VERSION = "5.0";
+        private const string VERSION_DATE = "2025-03-27";
+
+        // Core tracking variables
+        private double dailyPnL = 0;
+        private DateTime currentTradeDay = DateTime.MinValue;
+        private double initialBalance;
+        private int consecutiveLosses = 0;
+        private double lastTradeProfit = 0;
+        private int totalTrades = 0;
+        private int winningTrades = 0;
+        private double maxDrawdown = 0;
+        private double peakBalance;
+        private double todayOpenBalance;
+        private double pendingRiskAmount = 0;
+        private List<DateTime> tradeTimes = new List<DateTime>();
+        private List<double> tradeResults = new List<double>();
+        private int signalsToday = 0;
+        private int tradesPerDay = 0;
+        private bool dailyLimitHit = false;
+        private bool weeklyLimitHit = false;
+        private Dictionary<string, int> patternPerformance = new Dictionary<string, int>();
+
+        // Pattern detection series
+        private Series<double> swingHigh;
+        private Series<double> swingLow;
+        private Series<int> swingHighBar;
+        private Series<int> swingLowBar;
+        private Series<double> zigZagHigh;
+        private Series<double> zigZagLow;
+        private Series<int> zigZagHighBar;
+        private Series<int> zigZagLowBar;
+        private Series<bool> isSwingHigh;
+        private Series<bool> isSwingLow;
+
+        // Market environment indicators
+        private Series<double> atrSeries;
+        private Series<double> volatilityRatio;
+        private Series<int> marketStructure; // 1 = Trending, 0 = Ranging, -1 = Choppy
+
+        // Position management
+        private double entryPrice;
+        private double currentStopPrice;
+        private double currentTargetPrice;
+        private string activePattern;
+        private int currentPositionSize;
+        private DateTime lastTradeTime = DateTime.MinValue;
+        private DateTime lastDecisionTime = DateTime.MinValue;
+        private bool isBacktestMode = false;
+
+        // Volatility protection
+        private double baseATR;
+        private double recentAverageATR;
+        private bool volatilityAlert = false;
+        private Queue<double> atrHistory = new Queue<double>();
+        private int atrHistorySize = 20;
+
+        // Performance statistics
+        private double winRate = 0;
+        private double profitFactor = 0;
+        private double avgWin = 0;
+        private double avgLoss = 0;
+
+        // Visualization
+        private string panelText = "";
+        private Dictionary<string, int> patternCounter = new Dictionary<string, int>();
+        private List<string> zigZagLabels = new List<string>();
+        private List<string> patternLabels = new List<string>();
+
+        private ZigZag zigZagIndicator;
+
+
+        #endregion
+
+        #region Main Strategy Methods
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                // Version and descriptive information
+                Description = "B2B (Bearish to Bullish) Enhanced Strategy with streamlined risk management";
+                Name = "B2B Enhanced";
+                Version = STRATEGY_VERSION;
+                VersionDate = VERSION_DATE;
+
+                // Core strategy settings
+                Calculate = Calculate.OnBarClose;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 3600;
+
+                // Essential parameters (with safe defaults)
+                RiskPerTrade = 0.5;                   // Default risk percentage
+                MaxDailyLoss = 2000;                  // Daily loss limit
+                MaxDailyProfit = 0;                   // 0 = unlimited
+                EmergencyStopLossPercent = 10.0;      // 10% max drawdown
+                SlippageTicksBuffer = 2;              // Account for 2 ticks of slippage
+                EnableDynamicRisk = false;         // Off by default as it's an advanced feature
+
+
+                // ATR Settings
+                ATRPeriod = 14;
+                ATRMultiplier = 2.0;
+                ProfitTargetMultiplier = 1.5;
+                PatternLookback = 20;
+
+                // Position Management
+                MaxPositionSize = 2;                  // Maximum contracts
+                EnableDynamicStopLoss = true;         // Dynamic stops based on ATR
+                VolatilityProtectionMultiplier = 1.5; // This is within the allowed range
+
+
+                // Pattern Settings
+                UseBodyOnly = false;
+                ShowArrows = true;
+                ShowColoredBars = true;
+                SwingPointLookback = 2;
+                TrendBars = 5;
+                ShowLabel = false;
+
+                // Risk Management
+                EnableDailyLossLimit = true;        // Enable by default  
+                EnableDailyProfitTarget = false;    // Disable by default
+                MaxDailyLoss = 2000;                // Daily loss limit
+                MaxDailyProfit = 0;                 // 0 = unlimited
+
+                // Time filter defaults
+                EnableTimeFilter = true;
+                UseEasternTime = false;
+                TradingHoursStart = new TimeSpan(9, 30, 0);
+                TradingHoursEnd = new TimeSpan(16, 0, 0);
+                AvoidFirstMinutes = 15;
+                AvoidLastMinutes = 15;
+
+                // Visual Settings
+                CAHOLDColor = Brushes.DeepSkyBlue;
+                CBLOHDColor = Brushes.Gold;
+                UpArrowColor = Brushes.LimeGreen;
+                DownArrowColor = Brushes.Red;
+                EnableTradeStats = true;
+                ShowZigZag = true;
+                ShowPatternLabels = true;
+                ZigZagOpacity = 70;
+
+                // Detect if we're in backtesting mode
+                isBacktestMode = true; // Will be properly set in OnDataLoaded
+
+                // Initialize pattern counters
+                patternCounter["CAHOLD"] = 0;
+                patternCounter["CBLOHD"] = 0;
+            }
+            else if (State == State.Configure)
+            {
+
+
+                // Set up data series
+                AddDataSeries(BarsPeriodType.Minute, 1);
+
+                // Add plots for CAHOLD and CBLOHD patterns
+                AddPlot(new Stroke(CAHOLDColor, 2), PlotStyle.Block, "CAHOLD");
+                AddPlot(new Stroke(CBLOHDColor, 2), PlotStyle.Block, "CBLOHD");
+
+                // Add plots for ZigZag lines
+                if (ShowZigZag)
+                {
+                    AddPlot(new Stroke(Brushes.Blue, 2), PlotStyle.Line, "ZigZagHighs");
+                    AddPlot(new Stroke(Brushes.Red, 2), PlotStyle.Line, "ZigZagLows");
+                }
+
+                // Set BarsRequiredToTrade after PatternLookback is finalized
+                BarsRequiredToTrade = Math.Max(50, PatternLookback + 20);
+
+                // Initialize pattern performance dictionary
+                patternPerformance["CAHOLD"] = 0; // Net win count
+                patternPerformance["CBLOHD"] = 0; // Net win count
+
+                StopTargetHandling = StopTargetHandling.PerEntryExecution;
+            }
+
+            else if (State == State.DataLoaded)
+            {
+                // Initialize required series
+                InitializeSeries();
+
+                // Initialize the ZigZag indicator with default settings
+                zigZagIndicator = ZigZag(DeviationType.Points, 0.5, true);
+
+                // Get initial account balance
+                initialBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                peakBalance = initialBalance;
+                todayOpenBalance = initialBalance;
+
+                // Check if we're in backtest mode
+                isBacktestMode = Cbi.Connection.PlaybackConnection != null;
+
+                // Log strategy start
+                Log("Strategy initialized with version " + STRATEGY_VERSION + ", balance: $" + initialBalance);
+            }
+            else if (State == State.Terminated)
+            {
+                // Log final performance statistics
+                LogPerformanceStatistics();
+
+                // Clean up visualization elements
+                if (State == State.Terminated)
+                {
+                    try
+                    {
+                        // Remove trade stats panel
+                        RemoveDrawObject("TradeStatsPanel");
+
+                        // Remove ZigZag labels
+                        foreach (string label in zigZagLabels)
+                        {
+                            RemoveDrawObject(label);
+                        }
+
+                        // Remove pattern labels
+                        foreach (string label in patternLabels)
+                        {
+                            RemoveDrawObject(label);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private void InitializeSeries()
+        {
+            // Pattern detection series
+            swingHigh = new Series<double>(this);
+            swingLow = new Series<double>(this);
+            swingHighBar = new Series<int>(this);
+            swingLowBar = new Series<int>(this);
+            zigZagHigh = new Series<double>(this);
+            zigZagLow = new Series<double>(this);
+            zigZagHighBar = new Series<int>(this);
+            zigZagLowBar = new Series<int>(this);
+            isSwingHigh = new Series<bool>(this);
+            isSwingLow = new Series<bool>(this);
+
+            // Market environment indicators
+            atrSeries = new Series<double>(this);
+            volatilityRatio = new Series<double>(this);
+            marketStructure = new Series<int>(this);
+        }
+
+        protected override void OnBarUpdate()
+        {
+            try
+            {
+                // Calculate and store ATR for reference
+                atrSeries[0] = ATR(ATRPeriod)[0];
+
+                // Skip if not enough bars
+                if (CurrentBar < BarsRequiredToTrade)
+                {
+                    return;
+                }
+
+                // Update performance metrics daily
+                if (IsNewTradingDay())
+                {
+                    ResetDailyMetrics();
+                }
+
+                // Update market conditions and indicators
+                UpdateMarketConditionIndicators();
+
+                // Check system performance for daily profit/loss limits
+                if (EnableDailyLossLimit && MaxDailyLoss > 0)
+                {
+                    double currentLoss = todayOpenBalance - Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                    if (currentLoss >= MaxDailyLoss)
+                    {
+                        // If we hit daily loss limit, exit positions and set flag
+                        if (!dailyLimitHit)
+                        {
+                            dailyLimitHit = true;
+                            ExitAllPositions();
+                            Log($"DAILY LOSS LIMIT REACHED: Down ${currentLoss:F2} today (max ${MaxDailyLoss:F2}). Trading suspended.");
+                        }
+                        return; // Skip further processing
+                    }
+                }
+
+                // Check for daily profit target
+                if (EnableDailyProfitTarget && MaxDailyProfit > 0)
+                {
+                    if (dailyPnL >= MaxDailyProfit)
+                    {
+                        // If we hit daily profit target, exit positions and set flag
+                        if (!dailyLimitHit)
+                        {
+                            dailyLimitHit = true;
+                            ExitAllPositions();
+                            Log($"DAILY PROFIT TARGET REACHED: ${dailyPnL:F2} exceeds ${MaxDailyProfit:F2}. Trading suspended.");
+                        }
+                        return; // Skip further processing
+                    }
+                }
+
+                // Check for global risk management stops
+                if (CheckGlobalRiskManagement() || CheckProfitTarget())
+                {
+                    return;
+                }
+
+                // Skip further processing if outside trading hours
+                if (!IsAllowedTradeTime())
+                {
+                    return;
+                }
+
+                // Update swing points and pattern recognition
+                UpdateSwingPoints();
+
+                // Detect patterns
+                bool isCAHOLD = IsCAHOLDPattern();
+                bool isCBLOHD = IsCBLOHDPattern();
+
+                // Update plot values for visualization
+                UpdatePlotValues(isCAHOLD, isCBLOHD);
+
+                // Use the ZigZag for visualization if ShowZigZag is true
+                if (ShowZigZag && CurrentBar > 2)
+                {
+                    DrawZigZagLines();
+                }
+
+                // Apply visualization if enabled
+                if (ShowColoredBars)
+                {
+                    ApplyVisualization(isCAHOLD, isCBLOHD);
+                }
+
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    // Apply dynamic stop management if enabled
+                    if (EnableDynamicStopLoss)
+                    {
+                        UpdateDynamicStops();
+                    }
+
+                    // Additional position management can still be handled in ManageActivePosition
+                    ManageActivePosition();
+                }
+                // Check for new trade signals if we have no active position
+                // and not hit daily loss/profit limits
+                else if (!dailyLimitHit && IsSafeToTrade())
+                {
+                    // Process entry signals
+                    double atr = atrSeries[0];
+
+                    if (isCAHOLD)
+                    {
+                        ProcessEntry(MarketPosition.Long, atr, "CAHOLD");
+                    }
+                    else if (isCBLOHD)
+                    {
+                        ProcessEntry(MarketPosition.Short, atr, "CBLOHD");
+                    }
+                }
+
+                // Update trade stats panel
+                if (EnableTradeStats)
+                {
+                    UpdateTradeStatsPanel();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in OnBarUpdate: " + ex.Message);
+                Log("Stack trace: " + ex.StackTrace);
+
+                // Safety measure - close positions on error
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    ExitAllPositions();
+                }
+            }
+        }
+
+        #endregion
+
+        #region Visualization Methods
+
+        private void UpdateTradeStatsPanel()
+        {
+            try
+            {
+                if (!EnableTradeStats) return;
+
+                // Calculate current drawdown
+                double currentBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                double currentDrawdown = Math.Max(peakBalance - currentBalance, 0);
+                maxDrawdown = Math.Max(maxDrawdown, currentDrawdown);
+
+                // Update win rate
+                string winRateStr = totalTrades > 0 ? $"{(winningTrades * 100.0 / totalTrades):F1}%" : "N/A";
+
+                // Format the panel text
+                panelText = $"B2B Strategy v{STRATEGY_VERSION}\n" +
+                           $"Win Rate: {winRateStr} ({winningTrades}/{totalTrades})\n" +
+                           $"Daily P&L: ${dailyPnL:F2}\n" +
+                           $"Max Drawdown: ${maxDrawdown:F2}\n";
+
+                // Show daily loss limit if enabled
+                if (EnableDailyLossLimit)
+                {
+                    panelText += $"Daily Loss Limit: ${MaxDailyLoss:F2}\n";
+                }
+
+                // Show daily profit target if enabled
+                if (EnableDailyProfitTarget && MaxDailyProfit > 0)
+                {
+                    panelText += $"Daily Profit Target: ${MaxDailyProfit:F2}\n";
+                }
+
+                if (EnableDynamicRisk && totalTrades > 0)
+                {
+                    double currentRisk = AdjustRiskBasedOnPerformance();
+                    panelText += $"Current Risk: {currentRisk:F2}%\n";
+                }
+                else
+                {
+                    panelText += $"Risk Per Trade: {RiskPerTrade:F2}%\n";
+                }
+                // Add pattern performance
+                panelText += $"CAHOLD: {patternCounter["CAHOLD"]}\n";
+                panelText += $"CBLOHD: {patternCounter["CBLOHD"]}";
+
+                Draw.TextFixed(this, "TradeStatsPanel", panelText, TextPosition.BottomLeft,
+                    Brushes.White, new SimpleFont("Arial", 9),
+                    Brushes.Black, Brushes.DarkBlue, 80);
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in UpdateTradeStatsPanel: {ex.Message}");
+            }
+        }
+
+        private void DrawZigZagLines()
+        {
+            try
+            {
+                // We need at least 2 points to draw lines
+                if (CurrentBar < 2)
+                    return;
+
+                // Update ZigZag plot values
+                if (isSwingHigh[1])
+                {
+                    Values[2][1] = zigZagHigh[1]; // ZigZagHighs plot
+
+                    // Add label to swing high if enabled
+                    if (ShowPatternLabels)
+                    {
+                        string labelText = $"H: {zigZagHigh[1]:F2}";
+                        string labelName = $"SwingH_{CurrentBar - 1}";
+
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, labelName, labelText, 1, zigZagHigh[1],
+                            new SolidColorBrush(Color.FromArgb((byte)(ZigZagOpacity * 2.55), 0, 0, 255)));
+                        zigZagLabels.Add(labelName);
+                    }
+                }
+                else
+                {
+                    Values[2][1] = double.NaN;
+                }
+
+                if (isSwingLow[1])
+                {
+                    Values[3][1] = zigZagLow[1]; // ZigZagLows plot
+
+                    // Add label to swing low if enabled
+                    if (ShowPatternLabels)
+                    {
+                        string labelText = $"L: {zigZagLow[1]:F2}";
+                        string labelName = $"SwingL_{CurrentBar - 1}";
+
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, labelName, labelText, 1, zigZagLow[1],
+                            new SolidColorBrush(Color.FromArgb((byte)(ZigZagOpacity * 2.55), 255, 0, 0)));
+                        zigZagLabels.Add(labelName);
+                    }
+                }
+                else
+                {
+                    Values[3][1] = double.NaN;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in DrawZigZagLines: {ex.Message}");
+            }
+        }
+
+        private void ApplyVisualization(bool isCAHOLD, bool isCBLOHD)
+        {
+            try
+            {
+                // Set default colors if no pattern
+                if (!isCAHOLD && !isCBLOHD)
+                {
+                    BarBrushes[0] = Close[0] >= Open[0] ? Brushes.LimeGreen : Brushes.Red;
+                    CandleOutlineBrushes[0] = Close[0] >= Open[0] ? Brushes.LimeGreen : Brushes.Red;
+                    return;
+                }
+
+                // Apply pattern colors
+                if (ShowColoredBars)
+                {
+                    if (isCAHOLD)
+                    {
+                        BarBrushes[0] = CAHOLDColor;
+                        CandleOutlineBrushes[0] = CAHOLDColor;
+
+                        // Increment pattern counter
+                        patternCounter["CAHOLD"]++;
+                    }
+                    else if (isCBLOHD)
+                    {
+                        BarBrushes[0] = CBLOHDColor;
+                        CandleOutlineBrushes[0] = CBLOHDColor;
+
+                        // Increment pattern counter
+                        patternCounter["CBLOHD"]++;
+                    }
+                }
+
+                // Draw arrows
+                if (ShowArrows)
+                {
+                    if (isCAHOLD)
+                    {
+                        double arrowY = Low[0] - (TickSize * 5);
+                        Draw.ArrowUp(this, "Up" + CurrentBar, false, 0, arrowY, UpArrowColor);
+                    }
+                    else if (isCBLOHD)
+                    {
+                        double arrowY = High[0] + (TickSize * 5);
+                        Draw.ArrowDown(this, "Down" + CurrentBar, false, 0, arrowY, DownArrowColor);
+                    }
+                }
+
+                // Draw pattern labels
+                if (ShowPatternLabels)
+                {
+                    string labelName = "";
+
+                    if (isCAHOLD)
+                    {
+                        double labelY = Low[0] - (TickSize * 10);
+                        labelName = "PatternCAHOLD_" + CurrentBar;
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, labelName, "CAHOLD", 0, labelY, CAHOLDColor);
+                        patternLabels.Add(labelName);
+
+                        // Draw pattern structure if enabled
+                        if (ShowPatternStructure)
+                        {
+                            DrawPatternStructure("CAHOLD", labelName);
+                        }
+                    }
+                    else if (isCBLOHD)
+                    {
+                        double labelY = High[0] + (TickSize * 10);
+                        labelName = "PatternCBLOHD_" + CurrentBar;
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, labelName, "CBLOHD", 0, labelY, CBLOHDColor);
+                        patternLabels.Add(labelName);
+
+                        // Draw pattern structure if enabled
+                        if (ShowPatternStructure)
+                        {
+                            DrawPatternStructure("CBLOHD", labelName);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in ApplyVisualization: {ex.Message}");
+            }
+        }
+
+        private void DrawPatternStructure(string patternType, string baseName)
+        {
+            try
+            {
+                // Draw lines connecting the key points of the pattern
+                if (patternType == "CAHOLD")
+                {
+                    // Find the most recent swing low
+                    double swingLowPrice = double.MaxValue;
+                    int swingLowIndex = -1;
+
+                    for (int i = 1; i <= Math.Min(PatternLookback, CurrentBar); i++)
+                    {
+                        if (isSwingLow[i] && Low[i] < swingLowPrice)
+                        {
+                            swingLowPrice = Low[i];
+                            swingLowIndex = i;
+                        }
+                    }
+
+                    if (swingLowIndex > 0)
+                    {
+                        // The correct signature for Draw.Line
+                        Draw.Line(this, baseName + "_line", swingLowIndex, swingLowPrice, 0, Close[0], CAHOLDColor);
+
+                        // Add an annotation about the pattern
+                        double annotationY = (swingLowPrice + Close[0]) / 2;
+                        int midBarIndex = Math.Max(0, swingLowIndex / 2);
+                        string annotationText = $"+{((Close[0] - swingLowPrice) / swingLowPrice * 100):F1}%";
+
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, baseName + "_annotation", annotationText, midBarIndex, annotationY, CAHOLDColor);
+
+                        patternLabels.Add(baseName + "_line");
+                        patternLabels.Add(baseName + "_annotation");
+                    }
+                }
+                else if (patternType == "CBLOHD")
+                {
+                    // Find the most recent swing high
+                    double swingHighPrice = double.MinValue;
+                    int swingHighIndex = -1;
+
+                    for (int i = 1; i <= Math.Min(PatternLookback, CurrentBar); i++)
+                    {
+                        if (isSwingHigh[i] && High[i] > swingHighPrice)
+                        {
+                            swingHighPrice = High[i];
+                            swingHighIndex = i;
+                        }
+                    }
+
+                    if (swingHighIndex > 0)
+                    {
+                        // The correct signature for Draw.Line
+                        Draw.Line(this, baseName + "_line", swingHighIndex, swingHighPrice, 0, Close[0], CBLOHDColor);
+
+                        // Add an annotation about the pattern
+                        double annotationY = (swingHighPrice + Close[0]) / 2;
+                        int midBarIndex = Math.Max(0, swingHighIndex / 2);
+                        string annotationText = $"-{((swingHighPrice - Close[0]) / swingHighPrice * 100):F1}%";
+
+                        // Using correct parameter types for Draw.Text
+                        Draw.Text(this, baseName + "_annotation", annotationText, midBarIndex, annotationY, CBLOHDColor);
+
+                        patternLabels.Add(baseName + "_line");
+                        patternLabels.Add(baseName + "_annotation");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error in DrawPatternStructure: {ex.Message}");
+            }
+        }
+        private void UpdateMarketConditionIndicators()
+        {
+            // Track ATR history for volatility analysis
+            if (CurrentBar > ATRPeriod)
+            {
+                double currentAtr = atrSeries[0];
+
+                // Initialize baseATR if not set
+                if (baseATR == 0 && currentAtr > 0)
+                {
+                    baseATR = currentAtr;
+                }
+
+                // Track ATR history
+                atrHistory.Enqueue(currentAtr);
+                while (atrHistory.Count > atrHistorySize)
+                {
+                    atrHistory.Dequeue();
+                }
+
+                // Calculate recent average ATR
+                if (atrHistory.Count > 0)
+                {
+                    recentAverageATR = atrHistory.Average();
+
+                    // Calculate volatility ratio
+                    volatilityRatio[0] = recentAverageATR / baseATR;
+
+                    // Check for extreme volatility
+                    volatilityAlert = volatilityRatio[0] > VolatilityProtectionMultiplier;
+
+                    if (volatilityAlert && EnableVolatilityFilter)
+                    {
+                        Log($"VOLATILITY ALERT: Current volatility {volatilityRatio[0]:F2}x normal");
+                    }
+                }
+
+                // Determine market structure (trending vs ranging)
+                marketStructure[0] = DetermineMarketStructure();
+            }
+        }
+
+        private int DetermineMarketStructure()
+        {
+            // Simple method to determine if market is trending or ranging
+            double adx = ADX(14)[0];
+
+            if (adx > 30)
+                return 1;  // Trending
+            else if (adx > 20)
+                return 0;  // Ranging
+            else
+                return -1; // Choppy
+        }
+
+        #endregion
+
+        #region Risk Management
+
+        private bool CheckGlobalRiskManagement()
+        {
+            // Get current account status
+            double currentBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+
+            // Calculate losses
+            double totalDrawdown = initialBalance - currentBalance;
+            double totalDrawdownPercent = (totalDrawdown / initialBalance) * 100;
+            double dailyLoss = todayOpenBalance - currentBalance;
+
+            // 1. Emergency stop - check total account drawdown
+            if (totalDrawdownPercent >= EmergencyStopLossPercent)
+            {
+                ExitAllPositions();
+                Log($"EMERGENCY STOP: Account down {totalDrawdownPercent:F2}% from initial balance");
+                return true;
+            }
+
+            // 2. Daily loss limit (only if enabled)
+            if (EnableDailyLossLimit && MaxDailyLoss > 0 && dailyLoss >= MaxDailyLoss)
+            {
+                dailyLimitHit = true;
+                ExitAllPositions();
+                Log($"DAILY LOSS LIMIT REACHED: Down ${dailyLoss:F2} today (max ${MaxDailyLoss:F2}). Trading suspended.");
+                return true;
+            }
+            return false;
+        }
+        private bool CheckProfitTarget()
+        {
+            if (MaxDailyProfit <= 0) return false; // Skip if no profit target set
+
+            if (dailyPnL >= MaxDailyProfit)
+            {
+                dailyLimitHit = true;
+                ExitAllPositions();
+                Log($"DAILY PROFIT TARGET REACHED: ${dailyPnL:F2} exceeds goal of ${MaxDailyProfit:F2}. Trading suspended.");
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsSafeToTrade()
+        {
+            // Basic bar requirements
+            if (CurrentBar < BarsRequiredToTrade)
+            {
+                return false;
+            }
+
+            // Volume validation
+            if (Volume[0] <= 0)
+            {
+                return false;
+            }
+
+            // Check if we've hit our trading limits
+            if (TradingLimitsReached())
+            {
+                return false;
+            }
+
+            // Volatility check
+            if (EnableVolatilityFilter && volatilityAlert)
+            {
+                Log("Not safe to trade: Abnormal volatility detected");
+                return false;
+            }
+
+            // Market structure check - don't trade in choppy markets
+            if (EnableVolatilityFilter && marketStructure[0] == -1)
+            {
+                return false;
+            }
+
+            // Time-based rules
+            if (!IsAllowedTradeTime())
+            {
+                return false;
+            }
+
+            return true; // Default return true if all checks pass
+        }
+
+        private bool TradingLimitsReached()
+        {
+            // Daily loss limit (only if enabled)
+            if (EnableDailyLossLimit && dailyLimitHit)
+            {
+                return true;
+            }
+
+            // Daily profit target (only if enabled)
+            if (EnableDailyProfitTarget && dailyLimitHit && dailyPnL >= MaxDailyProfit)
+            {
+                return true;
+            }
+
+            // Weekly loss limit
+            if (weeklyLimitHit)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsAllowedTradeTime()
+        {
+            if (!EnableTimeFilter)
+                return true;
+
+            // Use appropriate time zone
+            DateTime currentTime = UseEasternTime ? GetAdjustedEasternTime(Time[0]) : Time[0];
+
+            // Check if within regular trading hours
+            bool withinRegularHours = IsWithinRegularTradingHours(currentTime);
+
+            // Apply buffer periods (avoid first/last X minutes)
+            if (withinRegularHours && AvoidFirstMinutes > 0)
+            {
+                // Convert current time to minutes since market open
+                double minutesSinceOpen = (currentTime.TimeOfDay - TradingHoursStart).TotalMinutes;
+                if (minutesSinceOpen < AvoidFirstMinutes)
+                {
+                    return false;
+                }
+            }
+
+            if (withinRegularHours && AvoidLastMinutes > 0)
+            {
+                // Convert current time to minutes before market close
+                double minutesBeforeClose = (TradingHoursEnd - currentTime.TimeOfDay).TotalMinutes;
+                if (minutesBeforeClose < AvoidLastMinutes)
+                {
+                    return false;
+                }
+            }
+
+            return withinRegularHours;
+        }
+
+        private bool IsWithinRegularTradingHours(DateTime time)
+        {
+            // Simple check if within primary trading hours
+            TimeSpan timeOfDay = time.TimeOfDay;
+            return timeOfDay >= TradingHoursStart && timeOfDay <= TradingHoursEnd;
+        }
+
+        private DateTime GetAdjustedEasternTime(DateTime time)
+        {
+            try
+            {
+                TimeZoneInfo easternZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+                return TimeZoneInfo.ConvertTimeFromUtc(time.ToUniversalTime(), easternZone);
+            }
+            catch (Exception)
+            {
+                // Fallback to local time
+                return time;
+            }
+        }
+
+        private void ExitAllPositions()
+        {
+            try
+            {
+                // Exit with a market order to ensure the position is closed
+                if (Position.MarketPosition == MarketPosition.Long)
+                {
+                    ExitLong(0, "Emergency Exit", "");
+                    Log("Emergency exit from LONG position");
+                }
+                else if (Position.MarketPosition == MarketPosition.Short)
+                {
+                    ExitShort(0, "Emergency Exit", "");
+                    Log("Emergency exit from SHORT position");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in ExitAllPositions: " + ex.Message);
+            }
+        }
+
+        private bool IsNewTradingDay()
+        {
+            if (currentTradeDay.Date != Time[0].Date)
+            {
+                // If this is not the very first bar
+                if (currentTradeDay != DateTime.MinValue)
+                {
+                    // Record previous day's results
+                    double accountValue = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                    Log($"Daily Report for {currentTradeDay.Date:MM/dd/yyyy}:");
+                    Log($"  P&L: ${dailyPnL:F2}");
+                    Log($"  Trades: {signalsToday}");
+                    Log($"  Account value: ${accountValue:F2}");
+
+                    // Reset weekly limit if it's a new week (Monday)
+                    if (Time[0].DayOfWeek == DayOfWeek.Monday)
+                    {
+                        weeklyLimitHit = false;
+                    }
+                }
+
+                // Update current day
+                currentTradeDay = Time[0].Date;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ResetDailyMetrics()
+        {
+            dailyLimitHit = false;
+            todayOpenBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+            dailyPnL = 0; // Reset daily PnL counter
+            signalsToday = 0; // Reset signals for the day
+
+            // Log daily reset
+            Log($"New trading day started. Balance: ${todayOpenBalance:F2}");
+        }
+
+        #endregion
+
+        #region Pattern Detection and Signal Processing
+
+        private void UpdateSwingPoints()
+        {
+            if (CurrentBar < SwingPointLookback)
+                return;
+
+            // Reset current bar states
+            isSwingHigh[0] = isSwingLow[0] = false;
+            zigZagHigh[0] = zigZagHigh[1];
+            zigZagLow[0] = zigZagLow[1];
+            zigZagHighBar[0] = zigZagHighBar[1];
+            zigZagLowBar[0] = zigZagLowBar[1];
+
+            // Calculate volatility-based minimum swing size
+            double minSwingSize = atrSeries[0] * 0.5;
+
+            // Cache current bar values
+            double currentHigh = UseBodyOnly ? Math.Max(Open[0], Close[0]) : High[0];
+            double currentLow = UseBodyOnly ? Math.Min(Open[0], Close[0]) : Low[0];
+
+            // Combined swing high check (simplified from original for clarity)
+            bool isHigherThanPrevious = true;
+            for (int i = 1; i <= SwingPointLookback && isHigherThanPrevious; i++)
+            {
+                if (CurrentBar < i) break;
+                double compareHigh = UseBodyOnly ? Math.Max(Open[i], Close[i]) : High[i];
+                isHigherThanPrevious = currentHigh > compareHigh;
+            }
+
+            // Combined swing low check (simplified from original for clarity)
+            bool isLowerThanPrevious = true;
+            for (int i = 1; i <= SwingPointLookback && isLowerThanPrevious; i++)
+            {
+                if (CurrentBar < i) break;
+                double compareLow = UseBodyOnly ? Math.Min(Open[i], Close[i]) : Low[i];
+                isLowerThanPrevious = currentLow < compareLow;
+            }
+
+            // Process confirmed swing high with minimum size requirement
+            if (isHigherThanPrevious)
+            {
+                // Calculate size
+                double swingHighSize = CalculateSwingSize(true, currentHigh);
+
+                if (swingHighSize >= minSwingSize)
+                {
+                    isSwingHigh[0] = true;
+                    zigZagHigh[0] = currentHigh;
+                    zigZagHighBar[0] = CurrentBar;
+                }
+            }
+
+            // Process confirmed swing low with minimum size requirement
+            if (isLowerThanPrevious)
+            {
+                // Calculate size
+                double swingLowSize = CalculateSwingSize(false, currentLow);
+
+                if (swingLowSize >= minSwingSize)
+                {
+                    isSwingLow[0] = true;
+                    zigZagLow[0] = currentLow;
+                    zigZagLowBar[0] = CurrentBar;
+                }
+            }
+
+            // Additional validation: Prevent swing high and low on same bar
+            if (isSwingHigh[0] && isSwingLow[0])
+            {
+                ResolveSwingConflict();
+            }
+
+            // Additional volume confirmation
+            if ((isSwingHigh[0] || isSwingLow[0]) && Volume[0] <= SMA(Volume, 20)[0])
+            {
+                // Reset swing points if volume is below average
+                isSwingHigh[0] = isSwingLow[0] = false;
+                zigZagHigh[0] = zigZagHigh[1];
+                zigZagLow[0] = zigZagLow[1];
+                zigZagHighBar[0] = zigZagHighBar[1];
+                zigZagLowBar[0] = zigZagLowBar[1];
+            }
+        }
+
+
+        private double CalculateSwingSize(bool isHigh, double currentValue)
+        {
+            double swingSize = 0;
+
+            for (int i = 1; i <= SwingPointLookback; i++)
+            {
+                if (CurrentBar < i) break;
+                double compareValue = isHigh ?
+                    (UseBodyOnly ? Math.Min(Open[i], Close[i]) : Low[i]) :
+                    (UseBodyOnly ? Math.Max(Open[i], Close[i]) : High[i]);
+
+                double size = isHigh ?
+                    Math.Abs(currentValue - compareValue) :
+                    Math.Abs(compareValue - currentValue);
+
+                swingSize = Math.Max(swingSize, size);
+            }
+
+            return swingSize;
+        }
+
+        private void ResolveSwingConflict()
+        {
+            // If both swing high and low, keep the one with larger swing size
+            double highSwingSize = zigZagHigh[0] - zigZagLow[1];
+            double lowSwingSize = zigZagHigh[1] - zigZagLow[0];
+
+            if (highSwingSize > lowSwingSize)
+            {
+                isSwingLow[0] = false;
+                zigZagLow[0] = zigZagLow[1];
+                zigZagLowBar[0] = zigZagLowBar[1];
+            }
+            else
+            {
+                isSwingHigh[0] = false;
+                zigZagHigh[0] = zigZagHigh[1];
+                zigZagHighBar[0] = zigZagHighBar[1];
+            }
+        }
+
+        private bool IsCAHOLDPattern()
+        {
+            try
+            {
+                if (CurrentBar < Math.Max(BarsRequiredToTrade, PatternLookback))
+                    return false;
+
+                // Find the most recent swing low
+                double swingLowPrice = double.MaxValue;
+                int swingLowIndex = -1;
+
+                for (int i = 1; i <= Math.Min(PatternLookback, CurrentBar); i++)
+                {
+                    if (isSwingLow[i] && Low[i] < swingLowPrice)
+                    {
+                        swingLowPrice = Low[i];
+                        swingLowIndex = i;
+                    }
+                }
+
+                // No valid swing low found
+                if (swingLowIndex == -1)
+                    return false;
+
+                // Get the high of the swing low bar
+                double lowDayHigh = UseBodyOnly ?
+                    Math.Max(Open[swingLowIndex], Close[swingLowIndex]) :
+                    High[swingLowIndex];
+
+                // Pattern requirements
+                bool hasCloseAboveHigh = Close[0] > lowDayHigh;
+                bool isBullishCandle = Close[0] > Open[0];
+                bool hasMinimumBarsElapsed = (CurrentBar - swingLowIndex) >= 2;
+                bool isInDowntrend = IsInDowntrend();
+                bool hasVolume = Volume[0] >= SMA(Volume, 20)[0] * 0.8; // At least 80% of average volume
+
+                // New additional check: Price must have moved at least 0.5*ATR in our favor since entry
+                bool hasSufficientMomentum = (Close[0] - Open[0]) >= (0.5 * atrSeries[0]);
+
+                // Check if this would be a good trade based on current market conditions
+                bool isGoodMarketCondition = !volatilityAlert && marketStructure[0] != -1;
+
+                // Return combined result for CAHOLD pattern
+                return hasCloseAboveHigh && isBullishCandle && hasMinimumBarsElapsed &&
+                       isInDowntrend && hasVolume && hasSufficientMomentum && isGoodMarketCondition;
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in IsCAHOLDPattern: " + ex.Message);
+                return false;
+            }
+        }
+
+        private bool IsCBLOHDPattern()
+        {
+            try
+            {
+                if (CurrentBar < Math.Max(BarsRequiredToTrade, PatternLookback))
+                    return false;
+
+                // Find the most recent swing high
+                double swingHighPrice = double.MinValue;
+                int swingHighIndex = -1;
+
+                for (int i = 1; i <= Math.Min(PatternLookback, CurrentBar); i++)
+                {
+                    if (isSwingHigh[i] && High[i] > swingHighPrice)
+                    {
+                        swingHighPrice = High[i];
+                        swingHighIndex = i;
+                    }
+                }
+
+                // No valid swing high found
+                if (swingHighIndex == -1)
+                    return false;
+
+                // Get the low of the swing high bar
+                double highDayLow = UseBodyOnly ?
+                    Math.Min(Open[swingHighIndex], Close[swingHighIndex]) :
+                    Low[swingHighIndex];
+
+                // Pattern requirements
+                bool hasCloseBelowLow = Close[0] < highDayLow;
+                bool isBearishCandle = Close[0] < Open[0];
+                bool hasMinimumBarsElapsed = (CurrentBar - swingHighIndex) >= 2;
+                bool isInUptrend = IsInUptrend();
+                bool hasVolume = Volume[0] >= SMA(Volume, 20)[0] * 0.8; // At least 80% of average volume
+
+                // New additional check: Price must have moved at least 0.5*ATR in our favor since entry
+                bool hasSufficientMomentum = (Open[0] - Close[0]) >= (0.5 * atrSeries[0]);
+
+                // Check if this would be a good trade based on current market conditions
+                bool isGoodMarketCondition = !volatilityAlert && marketStructure[0] != -1;
+
+                // Return combined result for CBLOHD pattern
+                return hasCloseBelowLow && isBearishCandle && hasMinimumBarsElapsed &&
+                       isInUptrend && hasVolume && hasSufficientMomentum && isGoodMarketCondition;
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in IsCBLOHDPattern: " + ex.Message);
+                return false;
+            }
+        }
+
+        private bool IsInDowntrend()
+        {
+            // Improve trend detection with more reliable criteria
+            if (CurrentBar < TrendBars)
+                return false;
+
+            // Check for at least 2 lower swing highs
+            int swingCount = 0;
+            double lastSwingHigh = double.MaxValue;
+
+            for (int i = 1; i < 10; i++)
+            {
+                if (isSwingHigh[i])
+                {
+                    if (zigZagHigh[i] < lastSwingHigh)
+                    {
+                        swingCount++;
+                        lastSwingHigh = zigZagHigh[i];
+                    }
+                    else break;
+                }
+            }
+
+            // Additional trend validation
+            bool priceDowntrend = SMA(Close, 20)[0] < SMA(Close, 20)[5];
+            bool macdConfirmation = MACD(12, 26, 9).Diff[0] < 0;
+
+            // Return true if we have at least 2 lower highs AND either price is in downtrend or MACD confirms
+            return swingCount >= 2 && (priceDowntrend || macdConfirmation);
+        }
+
+        private bool IsInUptrend()
+        {
+            // Improve trend detection with more reliable criteria
+            if (CurrentBar < TrendBars)
+                return false;
+
+            // Check for at least 2 higher swing lows
+            int swingCount = 0;
+            double lastSwingLow = double.MinValue;
+
+            for (int i = 1; i < 10; i++)
+            {
+                if (isSwingLow[i])
+                {
+                    if (zigZagLow[i] > lastSwingLow)
+                    {
+                        swingCount++;
+                        lastSwingLow = zigZagLow[i];
+                    }
+                    else break;
+                }
+            }
+
+            // Additional trend validation
+            bool priceUptrend = SMA(Close, 20)[0] > SMA(Close, 20)[5];
+            bool macdConfirmation = MACD(12, 26, 9).Diff[0] > 0;
+
+            // Return true if we have at least 2 higher lows AND either price is in uptrend or MACD confirms
+            return swingCount >= 2 && (priceUptrend || macdConfirmation);
+        }
+
+        private void UpdatePlotValues(bool isCAHOLD, bool isCBLOHD)
+        {
+            // Update plot values for visualization
+            Values[0][0] = isCAHOLD ? High[0] : double.NaN;  // CAHOLD plot
+            Values[1][0] = isCBLOHD ? Low[0] : double.NaN;   // CBLOHD plot
+        }
+
+        #endregion
+
+        #region Trade Management
+
+        private void ProcessEntry(MarketPosition direction, double atr, string patternType)
+        {
+            try
+            {
+                // Don't enter if we've hit daily limits
+                if (dailyLimitHit)
+                {
+                    return;
+                }
+
+                // Setup entry price
+                double entryPrice = Close[0];
+
+                // Calculate stops and targets based on ATR
+                double stopDistance = atr * ATRMultiplier;
+                double targetDistance = atr * ProfitTargetMultiplier;
+
+                // Direction-specific calculations
+                string entryName = "";
+
+                if (direction == MarketPosition.Long)
+                {
+                    entryName = patternType + "-Long";
+                }
+                else // Short position
+                {
+                    entryName = patternType + "-Short";
+                }
+
+                // Calculate position size
+                int size = CalculatePositionSize(entryPrice,
+                    direction == MarketPosition.Long ? entryPrice - stopDistance : entryPrice + stopDistance,
+                    direction);
+
+                // Enforce maximum position size
+                size = Math.Min(size, MaxPositionSize);
+
+                // Only enter if we have a valid position size
+                if (size > 0)
+                {
+                    // Store for tracking - STORE FULL SIGNAL NAME
+                    activePattern = entryName;
+                    currentPositionSize = size;
+
+                    // Set stops and targets globally BEFORE entry
+                    if (direction == MarketPosition.Long)
+                    {
+                        // For long positions
+                        SetStopLoss(CalculationMode.Price, entryPrice - stopDistance);
+                        SetProfitTarget(CalculationMode.Price, entryPrice + targetDistance);
+                        EnterLong(size, entryName);
+                    }
+                    else
+                    {
+                        // For short positions
+                        SetStopLoss(CalculationMode.Price, entryPrice + stopDistance);
+                        SetProfitTarget(CalculationMode.Price, entryPrice - targetDistance);
+                        EnterShort(size, entryName);
+                    }
+
+                    // Log trade details
+                    double riskAmount = Math.Abs(stopDistance) * size * Instrument.MasterInstrument.PointValue;
+                    double accountValue = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                    double riskPercent = (riskAmount / accountValue) * 100;
+
+                    Log($"New {direction} trade entered at {entryPrice:F2}, " +
+                        $"Stop: {(direction == MarketPosition.Long ? entryPrice - stopDistance : entryPrice + stopDistance):F2}, " +
+                        $"Target: {(direction == MarketPosition.Long ? entryPrice + targetDistance : entryPrice - targetDistance):F2}, " +
+                        $"Size: {size}, Pattern: {patternType}, Risk: {riskPercent:F2}%");
+
+                    // Update tracking variables
+                    entryPrice = Close[0];
+                    lastTradeTime = Time[0];
+                    signalsToday++;
+                    totalTrades++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in ProcessEntry: " + ex.Message);
+            }
+        }
+        private void UpdateDynamicStops()
+        {
+            if (Position.MarketPosition == MarketPosition.Flat || !EnableDynamicStopLoss)
+                return;
+
+            double atr = atrSeries[0];
+            double currentPrice = Close[0];
+            double positionEntryPrice = Position.AveragePrice;
+
+            // Calculate breakeven point (accounting for commissions)
+            double breakEvenPoint = positionEntryPrice;
+
+            // For long positions
+            if (Position.MarketPosition == MarketPosition.Long)
+            {
+                // Only trail if we're in profit by at least 0.5 ATR
+                if (currentPrice > positionEntryPrice + (0.5 * atr))
+                {
+                    // Calculate new stop level
+                    double newStop = Math.Max(
+                        Low[0] - (atr * 0.5),  // Current low minus 0.5 ATR
+                        positionEntryPrice      // Don't go below entry price once in profit
+                    );
+
+                    // Update stop loss using global method
+                    SetStopLoss(CalculationMode.Price, newStop);
+                    Log($"Updated LONG stop to {newStop:F2} (Entry: {positionEntryPrice:F2}, Current: {currentPrice:F2})");
+                }
+            }
+            // For short positions
+            else if (Position.MarketPosition == MarketPosition.Short)
+            {
+                // Only trail if we're in profit by at least 0.5 ATR
+                if (currentPrice < positionEntryPrice - (0.5 * atr))
+                {
+                    // Calculate new stop level
+                    double newStop = Math.Min(
+                        High[0] + (atr * 0.5),  // Current high plus 0.5 ATR
+                        positionEntryPrice       // Don't go above entry price once in profit
+                    );
+
+                    // Update stop loss using global method
+                    SetStopLoss(CalculationMode.Price, newStop);
+                    Log($"Updated SHORT stop to {newStop:F2} (Entry: {positionEntryPrice:F2}, Current: {currentPrice:F2})");
+                }
+            }
+        }
+        private void ManageActivePosition()
+        {
+            try
+            {
+                if (Position.MarketPosition == MarketPosition.Flat)
+                    return;
+
+                // Update stops at beginning of each bar
+                if (EnableDynamicStopLoss)
+                {
+                    UpdateStopLoss();
+                }
+
+                // Update profit targets if we've moved significantly in our favor
+                UpdateProfitTarget();
+
+                // Additional time-based management
+                TimeBasedPositionManagement();
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in ManageActivePosition: " + ex.Message);
+            }
+        }
+
+        private void UpdateStopLoss()
+        {
+            // Only update if we have a position
+            if (Position.MarketPosition == MarketPosition.Flat)
+                return;
+
+            double atr = atrSeries[0];
+            double newStopPrice = 0;
+
+            // Calculate new stop price based on position direction
+            if (Position.MarketPosition == MarketPosition.Long)
+            {
+                // For long positions
+                double trailingStop = Math.Max(Low[0] - (atr * ATRMultiplier), entryPrice);
+
+                // Only trail if price has moved in our favor significantly (0.5*ATR)
+                if (Close[0] >= entryPrice + (0.5 * atr))
+                {
+                    // Implement a trailing stop that ratchets up
+                    newStopPrice = Math.Max(trailingStop, currentStopPrice);
+
+                    // Don't let stop go above entry price unless we've moved at least 1 ATR
+                    if (newStopPrice > entryPrice && Close[0] < entryPrice + atr)
+                    {
+                        newStopPrice = entryPrice;
+                    }
+
+                    // Only update if the new stop is higher than the current stop
+                    if (newStopPrice > currentStopPrice)
+                    {
+                        // Use the pattern name that was stored during entry
+                        SetStopLoss(activePattern + "-Long", CalculationMode.Price, newStopPrice, false);
+                        currentStopPrice = newStopPrice;
+                        Log($"Updated LONG stop to {newStopPrice:F2}");
+                    }
+                }
+            }
+            else if (Position.MarketPosition == MarketPosition.Short)
+            {
+                // For short positions
+                double trailingStop = Math.Min(High[0] + (atr * ATRMultiplier), entryPrice);
+
+                // Only trail if price has moved in our favor significantly (0.5*ATR)
+                if (Close[0] <= entryPrice - (0.5 * atr))
+                {
+                    // Implement a trailing stop that ratchets down
+                    newStopPrice = Math.Min(trailingStop, currentStopPrice);
+
+                    // Don't let stop go below entry price unless we've moved at least 1 ATR
+                    if (newStopPrice < entryPrice && Close[0] > entryPrice - atr)
+                    {
+                        newStopPrice = entryPrice;
+                    }
+
+                    // Only update if the new stop is lower than the current stop
+                    if (newStopPrice < currentStopPrice)
+                    {
+                        // Use the pattern name that was stored during entry
+                        SetStopLoss(activePattern + "-Short", CalculationMode.Price, newStopPrice, false);
+                        currentStopPrice = newStopPrice;
+                        Log($"Updated SHORT stop to {newStopPrice:F2}");
+                    }
+                }
+            }
+        }
+
+        private void UpdateProfitTarget()
+        {
+            // Only update if we have a position
+            if (Position.MarketPosition == MarketPosition.Flat)
+                return;
+
+            double atr = atrSeries[0];
+            double newTargetPrice = 0;
+            string fullSignalName = activePattern; // This should already include "-Long" or "-Short"
+
+            // Calculate new trailing target based on position direction
+            if (Position.MarketPosition == MarketPosition.Long)
+            {
+                // For long positions, adjust target higher if price moves significantly in our favor
+                if (High[0] > currentTargetPrice * 0.9) // If we're approaching the target (90%)
+                {
+                    newTargetPrice = High[0] + (atr * 0.5); // Extend by half ATR
+
+                    if (newTargetPrice > currentTargetPrice)
+                    {
+                        // Use managed approach
+                        SetProfitTarget(fullSignalName, CalculationMode.Price, newTargetPrice);
+                        currentTargetPrice = newTargetPrice;
+                        Log($"Updated LONG profit target to {newTargetPrice:F2}");
+                    }
+                }
+            }
+            else if (Position.MarketPosition == MarketPosition.Short)
+            {
+                // For short positions, adjust target lower if price moves significantly in our favor
+                if (Low[0] < currentTargetPrice * 1.1) // If we're approaching the target (90%)
+                {
+                    newTargetPrice = Low[0] - (atr * 0.5); // Extend by half ATR
+
+                    if (newTargetPrice < currentTargetPrice)
+                    {
+                        // Use managed approach
+                        SetProfitTarget(fullSignalName, CalculationMode.Price, newTargetPrice);
+                        currentTargetPrice = newTargetPrice;
+                        Log($"Updated SHORT profit target to {newTargetPrice:F2}");
+                    }
+                }
+            }
+        }
+
+        private void TimeBasedPositionManagement()
+        {
+            // Close positions that have been open too long (4 hours)
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                TimeSpan positionDuration = Time[0] - lastTradeTime;
+                string fullSignalName = activePattern; // This should already include "-Long" or "-Short"
+
+                // Close position if it's been open for over 4 hours
+                if (positionDuration.TotalHours >= 4)
+                {
+                    if (Position.MarketPosition == MarketPosition.Long)
+                    {
+                        ExitLong(0, "Time Exit", fullSignalName);
+                        Log("Closed LONG position due to time limit (4 hours)");
+                    }
+                    else
+                    {
+                        ExitShort(0, "Time Exit", fullSignalName);
+                        Log("Closed SHORT position due to time limit (4 hours)");
+                    }
+                }
+
+                // Tighten stops if position has been open for over 2 hours
+                else if (positionDuration.TotalHours >= 2 && EnableDynamicStopLoss)
+                {
+                    double atr = atrSeries[0];
+
+                    if (Position.MarketPosition == MarketPosition.Long)
+                    {
+                        // Tighten to break-even + 0.5 ATR if we're in profit
+                        if (Close[0] > entryPrice)
+                        {
+                            double timeStop = Math.Max(entryPrice + (0.1 * atr), Low[0] - (0.5 * atr));
+                            if (timeStop > currentStopPrice)
+                            {
+                                // Use managed approach
+                                SetStopLoss(fullSignalName, CalculationMode.Price, timeStop, false);
+                                currentStopPrice = timeStop;
+                                Log($"Tightened LONG time-based stop to {timeStop:F2}");
+                            }
+                        }
+                    }
+                    else if (Position.MarketPosition == MarketPosition.Short)
+                    {
+                        // Tighten to break-even - 0.5 ATR if we're in profit
+                        if (Close[0] < entryPrice)
+                        {
+                            double timeStop = Math.Min(entryPrice - (0.1 * atr), High[0] + (0.5 * atr));
+                            if (timeStop < currentStopPrice)
+                            {
+                                // Use managed approach
+                                SetStopLoss(fullSignalName, CalculationMode.Price, timeStop, false);
+                                currentStopPrice = timeStop;
+                                Log($"Tightened SHORT time-based stop to {timeStop:F2}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private int CalculatePositionSize(double entryPrice, double stopPrice, MarketPosition direction)
+        {
+            try
+            {
+                // Safety check for valid prices
+                if (Math.Abs(entryPrice - stopPrice) <= 0)
+                    return 0;
+
+                // Get the current account value
+                double accountValue = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+
+                // Determine risk percentage to use
+                double riskPercentToUse;
+                if (EnableDynamicRisk)
+                {
+                    riskPercentToUse = AdjustRiskBasedOnPerformance();
+                    Log($"Using dynamically adjusted risk: {riskPercentToUse:F2}% (base: {RiskPerTrade:F2}%)");
+                }
+                else
+                {
+                    riskPercentToUse = RiskPerTrade;
+                }
+
+                // Calculate risk amount
+                double riskAmount = accountValue * (riskPercentToUse / 100.0);
+
+                // Get adjusted risk percentage based on performance
+                double adjustedRiskPercent = AdjustRiskBasedOnPerformance();
+                // Calculate risk per unit
+                double riskPerUnit = Math.Abs(entryPrice - stopPrice) * Instrument.MasterInstrument.PointValue;
+
+                if (riskPerUnit <= 0)
+                    return 0;
+
+                // Calculate position size based on risk
+                int size = (int)Math.Floor(riskAmount / riskPerUnit);
+
+                // Ensure minimum size
+                size = Math.Max(size, 1);
+
+                // Limit to maximum size
+                size = Math.Min(size, MaxPositionSize);
+
+                // Log the adjusted risk for transparency
+                Log($"Position sizing: Using adjusted risk of {adjustedRiskPercent:F2}% (base: {RiskPerTrade:F2}%), " +
+                    $"Size: {size} contracts, Risk amount: ${riskAmount:F2}");
+
+                return size;
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in CalculatePositionSize: " + ex.Message);
+                return 1; // Return minimal position size on error
+            }
+        }
+
+        private double AdjustRiskBasedOnPerformance()
+        {
+            // Start with the baseline risk percentage
+            double adjustedRisk = RiskPerTrade;
+            string adjustmentReason = "";
+
+            // If we have performance data
+            if (totalTrades > 10)
+            {
+                // Calculate win rate
+                winRate = (double)winningTrades / totalTrades;
+
+                // Adjust based on win rate
+                if (winRate > 0.6)
+                {
+                    adjustedRisk *= 1.1; // Slight increase for good performance
+                    adjustmentReason += "High win rate; ";
+                }
+                else if (winRate < 0.4)
+                {
+                    adjustedRisk *= 0.8; // Significant decrease for poor performance
+                    adjustmentReason += "Low win rate; ";
+                }
+
+                // Adjust based on recent performance (last 5 trades)
+                int recentWins = 0;
+
+                // Count recent wins in the last 5 trades
+                for (int i = 0; i < Math.Min(5, tradeResults.Count); i++)
+                {
+                    if (tradeResults[tradeResults.Count - 1 - i] > 0)
+                        recentWins++;
+                }
+
+                // Scale based on recent performance
+                double recentPerformanceFactor = recentWins / 5.0; // 0.0 to 1.0
+                double previousRisk = adjustedRisk;
+                adjustedRisk *= (0.8 + (recentPerformanceFactor * 0.4)); // Scale 0.8x to 1.2x
+
+                if (previousRisk != adjustedRisk)
+                    adjustmentReason += $"Recent performance ({recentWins}/5 wins); ";
+            }
+            else
+            {
+                // For new strategies with < 10 trades, be conservative
+                adjustedRisk *= 0.8;
+                adjustmentReason += "Limited trade history; ";
+            }
+
+            // Further risk reduction for volatile markets
+            if (volatilityRatio[0] > 1.2)
+            {
+                double previousRisk = adjustedRisk;
+                adjustedRisk *= (1.0 / volatilityRatio[0]);
+                if (previousRisk != adjustedRisk)
+                    adjustmentReason += $"High volatility ({volatilityRatio[0]:F2}x normal); ";
+            }
+
+            // Cap risk
+            adjustedRisk = Math.Min(adjustedRisk, 1.5);
+            adjustedRisk = Math.Max(adjustedRisk, 0.25);
+
+            // Log the adjustment details
+            if (!string.IsNullOrEmpty(adjustmentReason))
+            {
+                Log($"Risk adjusted from {RiskPerTrade:F2}% to {adjustedRisk:F2}% due to: {adjustmentReason}");
+            }
+
+            return adjustedRisk;
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            try
+            {
+                // Track information from each execution
+                if (execution.Order.OrderState == OrderState.Filled || execution.Order.OrderState == OrderState.PartFilled)
+                {
+                    // Check if this is a profit target or stop loss exit
+                    bool isProfitTarget = execution.Order.Name.Contains("Profit target");
+                    bool isStopLoss = execution.Order.Name.Contains("Stop loss");
+
+                    // Calculate the profit for this execution
+                    double executionProfit = 0;
+
+                    if (execution.Order.OrderAction == OrderAction.Sell)
+                    {
+                        // For selling a long position
+                        executionProfit = (execution.Price - entryPrice) * execution.Quantity * Instrument.MasterInstrument.PointValue;
+                    }
+                    else if (execution.Order.OrderAction == OrderAction.BuyToCover)
+                    {
+                        // For covering a short position
+                        executionProfit = (entryPrice - execution.Price) * execution.Quantity * Instrument.MasterInstrument.PointValue;
+                    }
+
+                    // Update trade statistics
+                    dailyPnL += executionProfit;
+                    tradeResults.Add(executionProfit);
+                    tradeTimes.Add(time);
+
+                    // Update win/loss statistics
+                    if (executionProfit > 0)
+                    {
+                        winningTrades++;
+                        consecutiveLosses = 0;
+                    }
+                    else if (executionProfit < 0)
+                    {
+                        consecutiveLosses++;
+                    }
+
+                    // Log execution information
+                    Log($"Execution: {execution.Order.Name}, Price: {execution.Price}, Quantity: {execution.Quantity}, " +
+                        $"P&L: ${executionProfit:F2}, Daily P&L: ${dailyPnL:F2}");
+
+                    // Check if we need to reset position tracking
+                    if (execution.Order.OrderState == OrderState.Filled && Position.MarketPosition == MarketPosition.Flat)
+                    {
+                        // Reset tracking variables when position is flat
+                        activePattern = "";
+                        currentPositionSize = 0;
+                    }
+
+                    // Track current account balance
+                    double currentBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+
+                    // Update peak balance if needed
+                    if (currentBalance > peakBalance)
+                    {
+                        peakBalance = currentBalance;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR in OnExecutionUpdate: " + ex.Message);
+            }
+        }
+
+        #endregion
+
+        #region Logging and Performance Tracking
+
+        private void Log(string message)
+        {
+            // Add timestamp to message
+            string timestampedMessage = $"[{Time[0]}] {message}";
+
+            // Print to NinjaTrader output
+            Print(timestampedMessage);
+
+            // Add to chart log if enabled
+            if (ShowLogOnChart)
+            {
+                string logName = "Log_" + DateTime.Now.Ticks.ToString();
+                // Using correct parameter types for Draw.Text
+                Draw.Text(this, logName, timestampedMessage, 0, High[0] + 10 * TickSize, Brushes.White);
+            }
+        }
+
+        private void LogPerformanceStatistics()
+        {
+            // Skip if we had no trades
+            if (totalTrades == 0)
+                return;
+
+            Log("=====================================");
+            Log("FINAL PERFORMANCE STATISTICS");
+            Log("=====================================");
+            Log($"Total Trades: {totalTrades}");
+            Log($"Winning Trades: {winningTrades} ({(double)winningTrades / totalTrades:P2})");
+            Log($"Losing Trades: {totalTrades - winningTrades} ({(double)(totalTrades - winningTrades) / totalTrades:P2})");
+
+            // Calculate profit factor and average wins/losses
+            double totalProfit = tradeResults.Where(r => r > 0).Sum();
+            double totalLoss = Math.Abs(tradeResults.Where(r => r < 0).Sum());
+            profitFactor = totalLoss > 0 ? totalProfit / totalLoss : 0;
+
+            Log($"Profit Factor: {profitFactor:F2}");
+
+            // Calculate averages
+            avgWin = tradeResults.Where(r => r > 0).Any() ?
+                tradeResults.Where(r => r > 0).Average() : 0;
+            avgLoss = tradeResults.Where(r => r < 0).Any() ?
+                tradeResults.Where(r => r < 0).Average() : 0;
+
+            Log($"Average Win: ${avgWin:F2}");
+            Log($"Average Loss: ${avgLoss:F2}");
+            Log($"W/L Ratio: {Math.Abs(avgWin / avgLoss):F2}");
+
+            // Pattern performance
+            Log("Pattern Performance:");
+            foreach (var pattern in patternPerformance)
+            {
+                Log($"  {pattern.Key}: {pattern.Value}");
+            }
+
+            // Final account value
+            double finalBalance = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+            double totalReturn = ((finalBalance - initialBalance) / initialBalance) * 100;
+            Log($"Starting Balance: ${initialBalance:F2}");
+            Log($"Final Balance: ${finalBalance:F2}");
+            Log($"Total Return: {totalReturn:F2}%");
+            Log("=====================================");
+        }
+
+        #endregion
+
+        #region Properties
+
+        [XmlIgnore]
+        [Display(Name = "Version",
+                 Description = "Strategy Version",
+                 Order = 1,
+                 GroupName = "1. Version Information")]
+        public string Version { get; private set; }
+
+        [XmlIgnore]
+        [Display(Name = "Version Date",
+                 Description = "Version Release Date",
+                 Order = 2,
+                 GroupName = "1. Version Information")]
+        public string VersionDate { get; private set; }
+
+        #region ATR Settings
+
+        [NinjaScriptProperty]
+        [Range(1, 50)]
+        [Display(Name = "ATR Period",
+                 Description = "Period for ATR calculation",
+                 Order = 1,
+                 GroupName = "2. ATR Settings")]
+        public int ATRPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "ATR Multiplier",
+                 Description = "Multiplier for ATR-based stops",
+                 Order = 2,
+                 GroupName = "2. ATR Settings")]
+        public double ATRMultiplier { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "Profit Target Multiplier",
+                 Description = "Multiplier for ATR-based profit targets",
+                 Order = 3,
+                 GroupName = "2. ATR Settings")]
+        public double ProfitTargetMultiplier { get; set; }
+
+        #endregion
+
+        #region Risk Management
+
+        [NinjaScriptProperty]
+        [Range(0.1, 5.0)]
+        [Display(Name = "Risk Per Trade (%)",
+                 Description = "Percentage of account to risk per trade",
+                 Order = 1,
+                 GroupName = "3. Risk Management")]
+        public double RiskPerTrade { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Daily Loss Limit",
+         Description = "Enable the maximum daily loss limit",
+         Order = 2,
+         GroupName = "3. Risk Management")]
+        public bool EnableDailyLossLimit { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Daily Profit Target",
+                 Description = "Enable the maximum daily profit target",
+                 Order = 3,
+                 GroupName = "3. Risk Management")]
+        public bool EnableDailyProfitTarget { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 1000000)]
+        [Display(Name = "Max Daily Loss ($)",
+                 Description = "Maximum daily loss in dollars",
+                 Order = 4,
+                 GroupName = "3. Risk Management")]
+        public double MaxDailyLoss { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 1000000)]
+        [Display(Name = "Max Daily Profit ($)",
+                 Description = "Maximum daily profit in dollars (0 = no limit)",
+                 Order = 5,
+                 GroupName = "3. Risk Management")]
+        public double MaxDailyProfit { get; set; }
+        [NinjaScriptProperty]
+        [Range(5.0, 50.0)]
+        [Display(Name = "Emergency Stop Loss (%)",
+                 Description = "Emergency stop trading when account drops by this percentage",
+                 Order = 4,
+                 GroupName = "3. Risk Management")]
+        public double EmergencyStopLossPercent { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 10)]
+        [Display(Name = "Slippage Ticks Buffer",
+                 Description = "Additional ticks to add to stops for slippage protection",
+                 Order = 5,
+                 GroupName = "3. Risk Management")]
+        public int SlippageTicksBuffer { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Dynamic Risk",
+         Description = "Automatically adjust risk based on performance",
+         Order = 6,
+         GroupName = "3. Risk Management")]
+        public bool EnableDynamicRisk { get; set; }
+
+        #endregion
+
+        #region Position Management
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Max Position Size",
+                 Description = "Maximum allowed position size in contracts",
+                 Order = 1,
+                 GroupName = "4. Position Management")]
+        public int MaxPositionSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Dynamic Stop Loss",
+                 Description = "Enable dynamic stop-loss based on ATR",
+                 Order = 2,
+                 GroupName = "4. Position Management")]
+        public bool EnableDynamicStopLoss { get; set; }
+
+        #endregion
+
+        #region Pattern Detection
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use Body Only",
+                 Description = "Use only candle body for calculations",
+                 Order = 1,
+                 GroupName = "5. Pattern Detection")]
+        public bool UseBodyOnly { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(2, 10)]
+        [Display(Name = "Swing Point Lookback",
+                 Description = "Number of bars to confirm swing points",
+                 Order = 2,
+                 GroupName = "5. Pattern Detection")]
+        public int SwingPointLookback { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 20)]
+        [Display(Name = "Trend Bars",
+                 Description = "Minimum bars needed to confirm trend",
+                 Order = 3,
+                 GroupName = "5. Pattern Detection")]
+        public int TrendBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 50)]
+        [Display(Name = "Pattern Lookback",
+                 Description = "Number of bars to look back for pattern detection",
+                 Order = 4,
+                 GroupName = "5. Pattern Detection")]
+        public int PatternLookback { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Volatility Filter",
+                 Description = "Filter trades during abnormal volatility",
+                 Order = 5,
+                 GroupName = "5. Pattern Detection")]
+        public bool EnableVolatilityFilter { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1.1, 3.0)]
+        [Display(Name = "Volatility Protection Multiplier",
+                 Description = "Stop trading when ATR increases by this factor",
+                 Order = 6,
+                 GroupName = "5. Pattern Detection")]
+        public double VolatilityProtectionMultiplier { get; set; }
+
+        #endregion
+
+        #region Visualization
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Arrows",
+                 Description = "Show pattern arrows",
+                 Order = 1,
+                 GroupName = "6. Visualization")]
+        public bool ShowArrows { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Colored Bars",
+                 Description = "Show colored pattern bars",
+                 Order = 2,
+                 GroupName = "6. Visualization")]
+        public bool ShowColoredBars { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Label",
+                 Description = "Show pattern labels",
+                 Order = 3,
+                 GroupName = "6. Visualization")]
+        public bool ShowLabel { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Log On Chart",
+                 Description = "Display log messages on chart",
+                 Order = 4,
+                 GroupName = "6. Visualization")]
+        public bool ShowLogOnChart { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "CAHOLD Color",
+                 Description = "Color for CAHOLD pattern",
+                 Order = 5,
+                 GroupName = "6. Visualization")]
+        public Brush CAHOLDColor { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "CBLOHD Color",
+                 Description = "Color for CBLOHD pattern",
+                 Order = 6,
+                 GroupName = "6. Visualization")]
+        public Brush CBLOHDColor { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "Up Arrow Color",
+                 Description = "Color for up arrows",
+                 Order = 7,
+                 GroupName = "6. Visualization")]
+        public Brush UpArrowColor { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "Down Arrow Color",
+                 Description = "Color for down arrows",
+                 Order = 8,
+                 GroupName = "6. Visualization")]
+        public Brush DownArrowColor { get; set; }
+
+        #endregion
+
+        #region Time Filter
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Time Filter",
+                 Description = "Enable time-based trading filter",
+                 Order = 1,
+                 GroupName = "7. Time Filter")]
+        public bool EnableTimeFilter { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use Eastern Time",
+                 Description = "Use Eastern Time instead of Local Time",
+                 Order = 2,
+                 GroupName = "7. Time Filter")]
+        public bool UseEasternTime { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trading Hours Start",
+                 Description = "Start time for regular trading hours",
+                 Order = 3,
+                 GroupName = "7. Time Filter")]
+        public TimeSpan TradingHoursStart { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trading Hours End",
+                 Description = "End time for regular trading hours",
+                 Order = 4,
+                 GroupName = "7. Time Filter")]
+        public TimeSpan TradingHoursEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 120)]
+        [Display(Name = "Avoid First X Minutes",
+                 Description = "Avoid trading in first X minutes of session",
+                 Order = 5,
+                 GroupName = "7. Time Filter")]
+        public int AvoidFirstMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 120)]
+        [Display(Name = "Avoid Last X Minutes",
+                 Description = "Avoid trading in last X minutes of session",
+                 Order = 6,
+                 GroupName = "7. Time Filter")]
+        public int AvoidLastMinutes { get; set; }
+
+        #endregion
+
+        // Visualization Properties
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Trade Stats Panel",
+                 Description = "Show trade statistics panel on chart",
+                 Order = 1,
+                 GroupName = "8. Advanced Visualization")]
+        public bool EnableTradeStats { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show ZigZag Lines",
+                 Description = "Show zigzag swing high/low connections",
+                 Order = 2,
+                 GroupName = "8. Advanced Visualization")]
+        public bool ShowZigZag { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Pattern Labels",
+                 Description = "Show pattern labels and annotations",
+                 Order = 3,
+                 GroupName = "8. Advanced Visualization")]
+        public bool ShowPatternLabels { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Pattern Structure",
+                 Description = "Show detailed pattern structure with lines and measurements",
+                 Order = 4,
+                 GroupName = "8. Advanced Visualization")]
+        public bool ShowPatternStructure { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(10, 100)]
+        [Display(Name = "ZigZag Opacity Percent",
+                 Description = "Transparency level for zigzag lines (10-100%)",
+                 Order = 6,
+                 GroupName = "8. Advanced Visualization")]
+        public int ZigZagOpacity { get; set; }
+
+        #region Serializable Properties (Hidden)
+
+        [Browsable(false)]
+        public string CAHOLDColorSerializable
+        {
+            get { return Serialize.BrushToString(CAHOLDColor); }
+            set { CAHOLDColor = Serialize.StringToBrush(value); }
+        }
+
+        [Browsable(false)]
+        public string CBLOHDColorSerializable
+        {
+            get { return Serialize.BrushToString(CBLOHDColor); }
+            set { CBLOHDColor = Serialize.StringToBrush(value); }
+        }
+
+        [Browsable(false)]
+        public string UpArrowColorSerializable
+        {
+            get { return Serialize.BrushToString(UpArrowColor); }
+            set { UpArrowColor = Serialize.StringToBrush(value); }
+        }
+
+        [Browsable(false)]
+        public string DownArrowColorSerializable
+        {
+            get { return Serialize.BrushToString(DownArrowColor); }
+            set { DownArrowColor = Serialize.StringToBrush(value); }
+        }
+
+        #endregion
+
+        #endregion
+    }
+}
