@@ -1,0 +1,33 @@
+# B2B Enhanced Strategy - Git Ignore Rules
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Test files  
+test_*.py
+*_test.py
+
+# Build artifacts (if any)
+*.dll
+*.pdb
+*.exe
+
+# IDE files
+*.user
+*.suo
+.vs/
+.vscode/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
